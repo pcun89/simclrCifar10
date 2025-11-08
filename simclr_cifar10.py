@@ -251,3 +251,99 @@ class CIFAR10Pair(Dataset):
         img, label = self.dataset[idx]
         x1, x2 = self.transform(img)
         return (x1, x2), label
+# -------------------------
+# Main
+# -------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SimCLR CIFAR-10 Example")
+    parser.add_argument("--data_root", type=str, default="./data")
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--epochs_pretrain", type=int, default=20)
+    parser.add_argument("--epochs_linear", type=int, default=10)
+    parser.add_argument("--lr_pretrain", type=float, default=1e-3)
+    parser.add_argument("--lr_linear", type=float, default=1e-2)
+    parser.add_argument("--projection_dim", type=int, default=128)
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    device = args.device
+    print(f"Using device: {device}")
+
+    # Pretraining transforms and dataloaders
+    simclrTransform = getSimCLRTransforms(imageSize=32)
+    trainPairDataset = CIFAR10Pair(
+        root=args.data_root, train=True, transform=simclrTransform)
+    pretrainLoader = DataLoader(
+        trainPairDataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+
+    # Initialize model, optimizer, loss
+    model = ResNetSimCLR(baseModel="resnet18",
+                         projectionDim=args.projection_dim).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr_pretrain, weight_decay=1e-6)
+    criterion = NTXentLoss(batchSize=args.batch_size,
+                           temperature=0.5, device=device).to(device)
+
+    # Pretraining loop
+    bestLoss = float("inf")
+    for epoch in range(1, args.epochs_pretrain + 1):
+        avgLoss = pretrainSimCLR(
+            model, pretrainLoader, optimizer, criterion, device, epoch)
+        print(f"Epoch {epoch}/{args.epochs_pretrain} - avgLoss: {avgLoss:.4f}")
+        if avgLoss < bestLoss:
+            bestLoss = avgLoss
+            torch.save(model.state_dict(), "simclr_encoder_best.pt")
+            print("Saved checkpoint simclr_encoder_best.pt")
+
+    # Linear evaluation: prepare plain CIFAR-10 loaders (standard transforms)
+    evalTransform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.247, 0.243, 0.261))
+    ])
+    trainEval = datasets.CIFAR10(
+        root=args.data_root, train=True, transform=evalTransform, download=True)
+    valEval = datasets.CIFAR10(
+        root=args.data_root, train=False, transform=evalTransform, download=True)
+    trainEvalLoader = DataLoader(
+        trainEval, batch_size=256, shuffle=True, num_workers=2, pin_memory=True)
+    valEvalLoader = DataLoader(
+        valEval, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+
+    # Load best encoder and freeze it
+    encoder = ResNetSimCLR(baseModel="resnet18",
+                           projectionDim=args.projection_dim)
+    # load weights for backbone and projection then move to device
+    encoder.load_state_dict(torch.load(
+        "simclr_encoder_best.pt", map_location=device))
+    encoder = encoder.to(device)
+    # Freeze backbone and projection (we only use backbone's representation)
+    for param in encoder.parameters():
+        param.requires_grad = False
+
+    # classifier that maps encoder representation to 10 classes
+    # We get rep dimension by running a dummy pass
+    encoder.eval()
+    with torch.no_grad():
+        dummy = torch.randn((1, 3, 32, 32)).to(device)
+        repDim = encoder.backbone(dummy).shape[1]
+
+    classifier = nn.Linear(repDim, 10).to(device)
+    optLinear = torch.optim.SGD(classifier.parameters(
+    ), lr=args.lr_linear, momentum=0.9, weight_decay=1e-6)
+
+    result = trainLinearEvaluation(encoder, classifier, trainEvalLoader,
+                                   valEvalLoader, optLinear, device, epochs=args.epochs_linear)
+    print("Linear evaluation result:", result["bestValAcc"])
+
+    # Save final classifier
+    torch.save({"encoder_state": encoder.state_dict(
+    ), "classifier_state": classifier.state_dict()}, "simclr_full_checkpoint.pt")
+    print("Saved simclr_full_checkpoint.pt")
+
+
+if __name__ == "__main__":
+    main()
